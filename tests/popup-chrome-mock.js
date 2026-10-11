@@ -26,7 +26,8 @@
         default: { id: "default", name: "默认分类", color: "#ffdd57" },
         study: { id: "study", name: "考试重点", color: "#7dd3fc" }
       },
-      translationSources: { mymemory: true, wiktionary: true }
+      translationSources: { mymemory: true, wiktionary: true, google: false },
+      googleProxyUrl: ""
     },
     history: { canUndo: true, canRedo: false, undoLabel: "添加 Serendipity", redoLabel: "" }
   };
@@ -40,7 +41,14 @@
   }
 
   globalThis.__popupMessages = [];
+  globalThis.__popupPermissionRequests = [];
   globalThis.chrome = {
+    permissions: {
+      async request(permission) {
+        globalThis.__popupPermissionRequests.push(permission);
+        return globalThis.__popupPermissionGranted !== false;
+      }
+    },
     commands: {
       getAll(callback) {
         callback([
@@ -92,6 +100,13 @@
           state.history = { canUndo: true, canRedo: false, undoLabel: `更新分类 ${category.name}`, redoLabel: "" };
           emitLocal({ vocabSettings: { newValue: state.settings } });
           return { ok: true, category, settings: state.settings, history: state.history };
+        }
+        if (message.type === "SET_GOOGLE_PROXY_URL") {
+          state.settings.googleProxyUrl = message.url;
+          if (!message.url) state.settings.translationSources.google = false;
+          state.history = { canUndo: true, canRedo: false, undoLabel: "修改反代地址", redoLabel: "" };
+          emitLocal({ vocabSettings: { newValue: state.settings } });
+          return { ok: true, settings: state.settings, history: state.history };
         }
         if (message.type === "SET_TRANSLATION_SOURCE") {
           state.settings.translationSources[message.source] = Boolean(message.enabled);

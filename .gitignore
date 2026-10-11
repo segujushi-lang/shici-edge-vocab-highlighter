@@ -12,3 +12,11 @@ tests/*.png
 .DS_Store
 Thumbs.db
 *.log
+
+# Self-hosted proxy tooling and local secrets
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+.env
+.env.*

@@ -75,6 +75,18 @@
           <span class="source-copy"><strong>中文维基词典</strong><small>可选来源，补充按词性的中文义项</small></span>
           <input id="wiktionarySourceToggle" type="checkbox">
         </label>
+        <label class="source-option">
+          <span class="source-copy"><strong>Google（实验）</strong><small>通过自建反代获取译文和词性义项</small></span>
+          <input id="googleSourceToggle" type="checkbox">
+        </label>
+        <div class="proxy-settings">
+          <label for="googleProxyUrlInput">Google 反代接口地址</label>
+          <div class="proxy-input-row">
+            <input id="googleProxyUrlInput" type="url" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="https://你的域名/translate" aria-describedby="googleProxyHint">
+            <button id="saveGoogleProxyButton" class="compact-button" type="button">保存</button>
+          </div>
+          <p id="googleProxyHint">先保存地址并授权，再开启 Google。支持 HTTPS 或本机 HTTP；留空保存可清除。部署方法见项目 proxy/README.md，服务与网络费用自理。</p>
+        </div>
         <p class="source-privacy">开启某来源后，自动翻译或主动刷新时会向该来源发送当前单个英文词；不会发送网页正文或来源地址。</p>
       </section>
 

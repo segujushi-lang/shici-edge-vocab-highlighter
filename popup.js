@@ -19,6 +19,8 @@
     getCategoryColor,
     getHighlightRgb,
     getTranslationSourceLabel,
+    normalizeGoogleProxyUrl,
+    getGoogleProxyOriginPattern,
     summarizeHistory,
     parseWordImportText
   } = globalThis.VocabGlowUtils;
@@ -43,6 +45,9 @@
     deleteCategoryButton: document.getElementById("deleteCategoryButton"),
     myMemorySourceToggle: document.getElementById("myMemorySourceToggle"),
     wiktionarySourceToggle: document.getElementById("wiktionarySourceToggle"),
+    googleSourceToggle: document.getElementById("googleSourceToggle"),
+    googleProxyUrlInput: document.getElementById("googleProxyUrlInput"),
+    saveGoogleProxyButton: document.getElementById("saveGoogleProxyButton"),
     translationSourceCount: document.getElementById("translationSourceCount"),
     addForm: document.getElementById("addForm"),
     addButton: document.getElementById("addButton"),
@@ -95,6 +100,14 @@
   elements.deleteCategoryButton.addEventListener("click", () => void handleCategoryDelete());
   elements.myMemorySourceToggle.addEventListener("change", () => void handleTranslationSourceChange("mymemory", elements.myMemorySourceToggle));
   elements.wiktionarySourceToggle.addEventListener("change", () => void handleTranslationSourceChange("wiktionary", elements.wiktionarySourceToggle));
+  elements.googleSourceToggle.addEventListener("change", () => void handleTranslationSourceChange("google", elements.googleSourceToggle));
+  elements.saveGoogleProxyButton.addEventListener("click", () => void handleGoogleProxySave());
+  elements.googleProxyUrlInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void handleGoogleProxySave();
+    }
+  });
   elements.importFileButton.addEventListener("click", () => {
     elements.importFileInput.value = "";
     elements.importFileInput.click();
@@ -168,6 +181,14 @@
     const enabled = toggle.checked;
     toggle.disabled = true;
     try {
+      if (source === "google" && enabled) {
+        if (!settings.googleProxyUrl) {
+          throw new Error("请先保存 Google 反代接口地址");
+        }
+        if (!await requestGoogleProxyPermission(settings.googleProxyUrl)) {
+          throw new Error("未授予反代地址访问权限，Google 保持关闭");
+        }
+      }
       const response = await sendMessage({ type: "SET_TRANSLATION_SOURCE", source, enabled });
       if (!response.ok) {
         throw new Error(response.error || "更新翻译来源失败");
@@ -175,13 +196,49 @@
       settings = sanitizeSettings(response.settings);
       applyHistoryResponse(response);
       renderTranslationSources();
-      const name = source === "wiktionary" ? "中文维基词典" : "MyMemory";
+      const name = source === "wiktionary" ? "中文维基词典" : getTranslationSourceLabel(source);
       showNotice(`${name}已${enabled ? "开启" : "关闭"} · 可撤回`);
     } catch (error) {
       toggle.checked = !enabled;
       showNotice(error instanceof Error ? error.message : "更新翻译来源失败", "error");
     } finally {
       toggle.disabled = false;
+    }
+  }
+
+  function requestGoogleProxyPermission(url) {
+    const origin = getGoogleProxyOriginPattern(url);
+    if (!origin || !chrome.permissions?.request) {
+      throw new Error("无法申请反代地址访问权限，请重新加载扩展");
+    }
+    // Request immediately in the user gesture, before messaging the background.
+    return chrome.permissions.request({ origins: [origin] });
+  }
+
+  async function handleGoogleProxySave() {
+    const rawUrl = elements.googleProxyUrlInput.value.trim();
+    const url = normalizeGoogleProxyUrl(rawUrl);
+    elements.saveGoogleProxyButton.disabled = true;
+    try {
+      if (rawUrl && !url) {
+        throw new Error("请输入 HTTPS 或本机 HTTP 完整接口地址，不带账号、查询参数或片段");
+      }
+      if (url && !await requestGoogleProxyPermission(url)) {
+        throw new Error("未授予反代地址访问权限，原配置未改变");
+      }
+      const response = await sendMessage({ type: "SET_GOOGLE_PROXY_URL", url });
+      if (!response.ok) {
+        throw new Error(response.error || "保存反代地址失败");
+      }
+      settings = sanitizeSettings(response.settings);
+      applyHistoryResponse(response);
+      elements.googleProxyUrlInput.value = settings.googleProxyUrl;
+      renderTranslationSources();
+      showNotice(url ? "反代地址已保存，请开启 Google 或刷新单个词条 · 可撤回" : "反代地址已清除，Google 已关闭 · 可撤回");
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "保存反代地址失败", "error");
+    } finally {
+      elements.saveGoogleProxyButton.disabled = false;
     }
   }
 
@@ -705,6 +762,10 @@
   function renderTranslationSources() {
     elements.myMemorySourceToggle.checked = Boolean(settings.translationSources.mymemory);
     elements.wiktionarySourceToggle.checked = Boolean(settings.translationSources.wiktionary);
+    elements.googleSourceToggle.checked = Boolean(settings.translationSources.google);
+    if (document.activeElement !== elements.googleProxyUrlInput) {
+      elements.googleProxyUrlInput.value = settings.googleProxyUrl;
+    }
     const enabledCount = Object.values(settings.translationSources).filter(Boolean).length;
     elements.translationSourceCount.textContent = `${enabledCount} 个已启用`;
   }

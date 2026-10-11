@@ -10,11 +10,12 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function createBackgroundHarness({ fetchImpl } = {}) {
+function createBackgroundHarness({ fetchImpl, permissionsGranted = true } = {}) {
   const local = {};
   const session = {};
   let fetchCalls = 0;
   const fetchUrls = [];
+  const permissionChecks = [];
   let messageListener;
   let commandListener;
 
@@ -33,6 +34,12 @@ function createBackgroundHarness({ fetchImpl } = {}) {
   }
 
   const chrome = {
+    permissions: {
+      async contains({ origins }) {
+        permissionChecks.push([...origins]);
+        return typeof permissionsGranted === "function" ? permissionsGranted(origins) : permissionsGranted;
+      }
+    },
     commands: {
       onCommand: { addListener(listener) { commandListener = listener; } }
     },
@@ -83,6 +90,7 @@ function createBackgroundHarness({ fetchImpl } = {}) {
     session,
     get fetchCalls() { return fetchCalls; },
     fetchUrls,
+    permissionChecks,
     async send(message) {
       return new Promise((resolveResponse) => {
         messageListener(message, {}, resolveResponse);
@@ -184,6 +192,232 @@ test("disabling every automatic source prevents all translation requests", async
   assert.equal(added.entry.translationStatus, "error");
   assert.equal(added.entry.translationResults.length, 0);
   assert.equal(harness.fetchCalls, 0);
+});
+
+test("Google proxy configuration and opt-in are reversible and never perform lookups", async () => {
+  const harness = createBackgroundHarness();
+  const initial = await harness.send({ type: "GET_STATE" });
+  assert.equal(initial.settings.googleProxyUrl, "");
+  assert.equal(initial.settings.translationSources.google, false);
+  const noEndpoint = await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "google", enabled: true });
+  assert.equal(noEndpoint.ok, false);
+  const invalid = await harness.send({ type: "SET_GOOGLE_PROXY_URL", url: "https://proxy.example/api?token=secret" });
+  assert.equal(invalid.ok, false);
+  const saved = await harness.send({ type: "SET_GOOGLE_PROXY_URL", url: "https://proxy.example/translate_a/single" });
+  assert.equal(saved.ok, true);
+  assert.equal(saved.settings.translationSources.google, false);
+  assert.equal(saved.history.undoLabel, "修改 Google 反代地址");
+  await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "google", enabled: true });
+  assert.equal(harness.local.vocabSettings.translationSources.google, true);
+  assert.equal(harness.fetchCalls, 0);
+  assert.deepEqual(harness.permissionChecks, [["https://proxy.example/*"]]);
+  await harness.send({ type: "UNDO_LAST_ACTION" });
+  assert.equal(harness.local.vocabSettings.translationSources.google, false);
+  await harness.send({ type: "REDO_LAST_ACTION" });
+  assert.equal(harness.local.vocabSettings.translationSources.google, true);
+  await harness.send({ type: "SET_GOOGLE_PROXY_URL", url: "" });
+  assert.equal(harness.local.vocabSettings.googleProxyUrl, "");
+  assert.equal(harness.local.vocabSettings.translationSources.google, false);
+  await harness.send({ type: "UNDO_LAST_ACTION" });
+  assert.equal(harness.local.vocabSettings.googleProxyUrl, "https://proxy.example/translate_a/single");
+  assert.equal(harness.local.vocabSettings.translationSources.google, true);
+  assert.equal(harness.fetchCalls, 0);
+});
+
+test("Google queries only the user proxy with the q-only protocol and privacy-safe fetch options", async () => {
+  const harness = createBackgroundHarness({
+    fetchImpl(url, options) {
+      const parsed = new URL(url);
+      assert.equal(parsed.origin, "http://127.0.0.1:8787");
+      assert.equal(parsed.pathname, "/translate_a/single");
+      assert.deepEqual([...parsed.searchParams.keys()], ["q"]);
+      assert.equal(parsed.searchParams.get("q"), "run");
+      assert.equal(parsed.searchParams.has("sourceUrl"), false);
+      assert.equal(options.credentials, "omit");
+      assert.equal(options.referrerPolicy, "no-referrer");
+      assert.equal(options.redirect, "error");
+      return jsonResponse({
+        sentences: [{ trans: "跑步" }],
+        dict: [{ pos: "verb", terms: ["运行", "执行", "跑"] }]
+      });
+    }
+  });
+  await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "mymemory", enabled: false });
+  await harness.send({ type: "SET_GOOGLE_PROXY_URL", url: "http://127.0.0.1:8787/translate_a/single" });
+  await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "google", enabled: true });
+  const added = await harness.send({ type: "ADD_WORD", word: "Run", sourceUrl: "https://private.example/page" });
+  assert.equal(added.ok, true);
+  assert.equal(added.entry.translation, "跑步");
+  assert.deepEqual(clone(added.entry.translationResults), [
+    { source: "google", text: "跑步" },
+    { source: "google", text: "运行；执行；跑", partOfSpeech: "动词" }
+  ]);
+  assert.equal(harness.fetchCalls, 1);
+  assert.deepEqual(harness.permissionChecks, [
+    ["http://127.0.0.1:8787/*"],
+    ["http://127.0.0.1:8787/*"]
+  ]);
+});
+
+test("background and the real proxy handler agree on the q-only gateway protocol", async () => {
+  const { createGoogleProxy } = await import("../proxy/worker.mjs");
+  let upstreamCalls = 0;
+  const proxy = createGoogleProxy({
+    fetchImpl: async (url) => {
+      upstreamCalls += 1;
+      const parsed = new URL(url);
+      assert.equal(parsed.origin, "https://translate.googleapis.com");
+      assert.equal(parsed.pathname, "/translate_a/single");
+      assert.equal(parsed.searchParams.get("client"), "gtx");
+      assert.equal(parsed.searchParams.get("sl"), "en");
+      assert.equal(parsed.searchParams.get("tl"), "zh-CN");
+      assert.equal(parsed.searchParams.get("dj"), "1");
+      assert.deepEqual(parsed.searchParams.getAll("dt"), ["t", "bd"]);
+      assert.equal(parsed.searchParams.get("q"), "bank");
+      return new Response(JSON.stringify({
+        sentences: [{ trans: "银行" }],
+        dict: [{ pos: "noun", terms: ["银行", "岸"] }]
+      }), { headers: { "Content-Type": "application/json" } });
+    }
+  });
+  const harness = createBackgroundHarness({
+    fetchImpl: (url, options) => proxy.fetch(new Request(String(url), options))
+  });
+  await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "mymemory", enabled: false });
+  await harness.send({ type: "SET_GOOGLE_PROXY_URL", url: "http://127.0.0.1:8787/translate" });
+  await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "google", enabled: true });
+  const added = await harness.send({ type: "ADD_WORD", word: "Bank" });
+  assert.equal(added.ok, true);
+  assert.equal(added.entry.translationStatus, "ready");
+  assert.deepEqual(clone(added.entry.translationResults), [
+    { source: "google", text: "银行" },
+    { source: "google", text: "银行；岸", partOfSpeech: "名词" }
+  ]);
+  assert.equal(upstreamCalls, 1);
+  assert.equal(harness.fetchUrls[0], "http://127.0.0.1:8787/translate?q=bank");
+});
+
+test("Google fails closed without permission and other sources still succeed", async () => {
+  let granted = false;
+  const harness = createBackgroundHarness({
+    permissionsGranted: () => granted,
+    fetchImpl(url) {
+      assert.equal(new URL(url).hostname, "api.mymemory.translated.net");
+      return jsonResponse({ responseStatus: 200, responseData: { translatedText: "好奇的" } });
+    }
+  });
+  await harness.send({ type: "SET_GOOGLE_PROXY_URL", url: "https://proxy.example/google" });
+  const denied = await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "google", enabled: true });
+  assert.equal(denied.ok, false);
+  assert.equal(harness.local.vocabSettings.translationSources.google, false);
+  assert.equal(harness.fetchCalls, 0);
+  granted = true;
+  await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "google", enabled: true });
+  granted = false;
+  const added = await harness.send({ type: "ADD_WORD", word: "Curious" });
+  assert.equal(added.entry.translationStatus, "ready");
+  assert.equal(added.entry.translation, "好奇的");
+  assert.equal(harness.fetchCalls, 1);
+  assert.equal(added.entry.translationResults.every((result) => result.source === "mymemory"), true);
+  await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "mymemory", enabled: false });
+  const googleOnly = await harness.send({ type: "ADD_WORD", word: "Private" });
+  assert.equal(googleOnly.entry.translationStatus, "error");
+  assert.equal(harness.fetchCalls, 1);
+});
+
+test("Google refresh replaces old automatic results while keeping manual definitions", async () => {
+  let iteration = 0;
+  const harness = createBackgroundHarness({
+    fetchImpl() {
+      iteration += 1;
+      return jsonResponse({ sentences: [{ trans: iteration === 1 ? "旧的谷歌释义" : "新的谷歌释义" }] });
+    }
+  });
+  await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "mymemory", enabled: false });
+  await harness.send({ type: "SET_GOOGLE_PROXY_URL", url: "https://proxy.example/google" });
+  await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "google", enabled: true });
+  await harness.send({ type: "ADD_WORD", word: "Run" });
+  await harness.send({ type: "UPDATE_TRANSLATION", key: "run", translation: "手工释义" });
+  const retried = await harness.send({ type: "RETRY_TRANSLATION", key: "run" });
+  assert.deepEqual(clone(retried.entry.translationResults), [
+    { source: "manual", text: "手工释义" },
+    { source: "google", text: "新的谷歌释义" }
+  ]);
+  assert.equal(retried.entry.translation, "手工释义");
+  assert.equal(harness.fetchCalls, 2);
+});
+
+for (const failureMode of ["network", "empty", "revoked permission"]) {
+  test(`Google cached definitions survive partial refresh failure: ${failureMode}`, async () => {
+    let googleMode = "initial";
+    let myMemoryText = "跑";
+    let permissionGranted = true;
+    const harness = createBackgroundHarness({
+      permissionsGranted: () => permissionGranted,
+      fetchImpl(url) {
+        if (new URL(url).hostname === "api.mymemory.translated.net") {
+          return jsonResponse({ responseStatus: 200, responseData: { translatedText: myMemoryText } });
+        }
+        if (googleMode === "network") throw new Error("Proxy unavailable");
+        return jsonResponse({
+          sentences: [{ trans: googleMode === "empty" ? "run" : googleMode === "recovered" ? "运转" : "运行" }]
+        });
+      }
+    });
+    await harness.send({ type: "SET_GOOGLE_PROXY_URL", url: "https://proxy.example/translate" });
+    await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "google", enabled: true });
+    await harness.send({ type: "ADD_WORD", word: "Run" });
+    await harness.send({ type: "UPDATE_TRANSLATION", key: "run", translation: "人工释义" });
+
+    myMemoryText = "奔跑";
+    googleMode = failureMode;
+    permissionGranted = failureMode !== "revoked permission";
+    const partial = await harness.send({ type: "RETRY_TRANSLATION", key: "run" });
+    assert.equal(partial.entry.translationStatus, "ready");
+    assert.deepEqual(clone(partial.entry.translationResults), [
+      { source: "manual", text: "人工释义" },
+      { source: "mymemory", text: "奔跑" },
+      { source: "google", text: "运行" }
+    ]);
+
+    permissionGranted = true;
+    googleMode = "recovered";
+    const recovered = await harness.send({ type: "RETRY_TRANSLATION", key: "run" });
+    assert.deepEqual(clone(recovered.entry.translationResults), [
+      { source: "manual", text: "人工释义" },
+      { source: "mymemory", text: "奔跑" },
+      { source: "google", text: "运转" }
+    ]);
+
+    await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "google", enabled: false });
+    const disabled = await harness.send({ type: "RETRY_TRANSLATION", key: "run" });
+    assert.deepEqual(clone(disabled.entry.translationResults), [
+      { source: "manual", text: "人工释义" },
+      { source: "mymemory", text: "奔跑" }
+    ]);
+  });
+}
+
+test("a delayed Google result cannot resurrect a removed word", async () => {
+  let releaseFetch;
+  let notifyFetchStarted;
+  const fetchStarted = new Promise((resolveStarted) => { notifyFetchStarted = resolveStarted; });
+  const harness = createBackgroundHarness({
+    fetchImpl() {
+      notifyFetchStarted();
+      return new Promise((resolveFetch) => { releaseFetch = resolveFetch; });
+    }
+  });
+  await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "mymemory", enabled: false });
+  await harness.send({ type: "SET_GOOGLE_PROXY_URL", url: "https://proxy.example/google" });
+  await harness.send({ type: "SET_TRANSLATION_SOURCE", source: "google", enabled: true });
+  await harness.send({ type: "ADD_WORD", word: "Run", translation: "人工释义" });
+  const retry = harness.send({ type: "RETRY_TRANSLATION", key: "run" });
+  await fetchStarted;
+  await harness.send({ type: "REMOVE_WORD", key: "run" });
+  releaseFetch(jsonResponse({ sentences: [{ trans: "迟到的译文" }] }));
+  await retry;
+  assert.equal(harness.local.vocabEntries.run, undefined);
 });
 
 test("background history restores entries and settings through undo and redo", async () => {

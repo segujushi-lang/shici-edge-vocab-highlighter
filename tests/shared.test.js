@@ -13,7 +13,8 @@ function loadUtils() {
     Set,
     RegExp,
     String,
-    Number
+    Number,
+    URL
   });
   const source = readFileSync(resolve(__dirname, "..", "shared.js"), "utf8");
   vm.runInContext(source, context, { filename: "shared.js" });
@@ -120,14 +121,87 @@ test("sanitizes highlight settings and converts the selected color to RGB", () =
   assert.equal(rgb.blue, 239);
   assert.deepEqual(JSON.parse(JSON.stringify(settings.translationSources)), {
     mymemory: true,
-    wiktionary: false
+    wiktionary: false,
+    google: false
   });
 
   const optedIn = utils.sanitizeSettings({ translationSources: { mymemory: false, wiktionary: true } });
   assert.deepEqual(JSON.parse(JSON.stringify(optedIn.translationSources)), {
     mymemory: false,
-    wiktionary: true
+    wiktionary: true,
+    google: false
   });
+});
+
+test("Google is opt-in and proxy settings sanitize without accepting credentials or public HTTP", () => {
+  assert.equal(utils.DEFAULT_SETTINGS.googleProxyUrl, "");
+  assert.equal(utils.sanitizeSettings(null).translationSources.google, false);
+  const settings = utils.sanitizeSettings({
+    googleProxyUrl: " HTTPS://Proxy.Example/translate_a/single ",
+    translationSources: { google: true }
+  });
+  assert.equal(settings.googleProxyUrl, "https://proxy.example/translate_a/single");
+  assert.equal(settings.translationSources.google, true);
+  assert.equal(utils.getGoogleProxyOriginPattern(settings.googleProxyUrl), "https://proxy.example/*");
+  for (const endpoint of [
+    "http://localhost:8787/translate_a/single",
+    "http://127.0.0.1:8787/translate_a/single",
+    "http://[::1]:8787/translate_a/single"
+  ]) {
+    assert.equal(utils.normalizeGoogleProxyUrl(endpoint), endpoint);
+  }
+  for (const endpoint of [
+    "http://proxy.example/api", "https://user:password@proxy.example/api", "https://@proxy.example/api",
+    "https://proxy.example/api?token=secret", "https://proxy.example/api?", "https://proxy.example/api#",
+    "https://proxy.example/api#fragment", "file:///translate", "//proxy.example/api", "not a URL",
+    "http://localhost.example/api", "http://127.0.0.2/api", "https://proxy.example/with space"
+  ]) {
+    assert.equal(utils.normalizeGoogleProxyUrl(endpoint), "", endpoint);
+    assert.equal(utils.getGoogleProxyOriginPattern(endpoint), "", endpoint);
+    assert.equal(utils.sanitizeSettings({ googleProxyUrl: endpoint }).googleProxyUrl, "", endpoint);
+  }
+});
+
+test("Google object JSON preserves the main translation and grouped Chinese dictionary terms", () => {
+  const results = utils.extractGoogleTranslations({
+    sentences: [{ trans: "跑步" }, { orig: "run" }],
+    dict: [
+      { pos: "verb", terms: ["运行", "执行", "跑", "运行", "run", null] },
+      { pos: "noun", terms: ["跑步", "路程"] },
+      { pos: "noun", terms: ["跑步", "路程"] },
+      { pos: "bad", terms: "not an array" }
+    ]
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(results)), [
+    { source: "google", text: "跑步" },
+    { source: "google", text: "运行；执行；跑", partOfSpeech: "动词" },
+    { source: "google", text: "跑步；路程", partOfSpeech: "名词" }
+  ]);
+  assert.equal(utils.getTranslationSourceLabel("google"), "Google（实验）");
+});
+
+test("Google legacy array JSON and missing dictionary data remain compatible", () => {
+  const results = utils.extractGoogleTranslations([
+    [["银", "bank"], ["行", "bank"]],
+    [["noun", ["银行", "岸", "堤", "坡", "库", "第六个义项"]]],
+    "en"
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(results)), [
+    { source: "google", text: "银行" },
+    { source: "google", text: "银行；岸；堤；坡；库", partOfSpeech: "名词" }
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(utils.extractGoogleTranslations([[["偶然性", "serendipity"]], null]))), [
+    { source: "google", text: "偶然性" }
+  ]);
+  for (const value of [null, undefined, {}, [], "invalid", { sentences: "bad", dict: [null, 12, {}] }]) {
+    assert.equal(utils.extractGoogleTranslations(value).length, 0);
+  }
+  assert.equal(utils.extractGoogleTranslations({ sentences: [{ trans: "untranslated" }] }).length, 0);
+  const limited = utils.extractGoogleTranslations({
+    sentences: [{ trans: "主译文" }],
+    dict: Array.from({ length: 10 }, (_, index) => ({ pos: "noun", terms: [`释义${index}`] }))
+  });
+  assert.equal(limited.length, 4);
 });
 
 test("migrates legacy words and global color into the default category", () => {

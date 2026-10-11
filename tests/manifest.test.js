@@ -15,6 +15,18 @@ test("manifest is a loadable MV3 extension with the required APIs", () => {
   assert.equal(manifest.background.service_worker, "background.js");
 });
 
+test("Google proxy access is optional and configured explicitly", () => {
+  assert.ok(manifest.optional_host_permissions.includes("https://*/*"));
+  assert.ok(manifest.optional_host_permissions.includes("http://127.0.0.1/*"));
+  assert.equal(manifest.host_permissions.includes("https://*/*"), false);
+  const html = readFileSync(resolve(root, "popup.html"), "utf8");
+  const script = readFileSync(resolve(root, "popup.js"), "utf8");
+  assert.match(html, /id="googleSourceToggle"(?![^>]+checked)/);
+  assert.match(html, /id="googleProxyUrlInput"/);
+  assert.match(script, /chrome\.permissions\.request\(\{ origins: \[origin\] \}\)/);
+  assert.match(script, /type: "SET_GOOGLE_PROXY_URL", url/);
+});
+
 test("every local file referenced by the manifest exists", () => {
   const paths = [
     manifest.background.service_worker,
@@ -38,6 +50,11 @@ test("color picker previews the highlight with dark and light page text", () => 
   assert.match(popupHtml, /class="preview-surface preview-dark"/);
   assert.match(popupCss, /\.preview-dark\s*\{[^}]*color:\s*#f8fafc/s);
   assert.match(popupCss, /rgb\(var\(--preview-rgb\)\s*\/\s*82%\)/);
+});
+
+test("popup width follows available space when a vertical scrollbar is present", () => {
+  const popupCss = readFileSync(resolve(root, "popup.css"), "utf8");
+  assert.match(popupCss, /body\s*\{[^}]*max-width:\s*100%;/s);
 });
 
 test("extension commands use explicit modifier shortcuts and stay within the browser limit", () => {

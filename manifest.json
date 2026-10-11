@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "拾词 · 网页生词荧光笔",
   "short_name": "拾词",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "分类保存或批量导入英文生词，按分类颜色高亮，并显示带来源标识的多条中文释义。",
   "author": "segujushi-lang",
   "homepage_url": "https://github.com/segujushi-lang/shici-edge-vocab-highlighter",
@@ -13,6 +13,12 @@
   "host_permissions": [
     "https://api.mymemory.translated.net/*",
     "https://zh.wiktionary.org/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "http://[::1]/*"
   ],
   "background": {
     "service_worker": "background.js"

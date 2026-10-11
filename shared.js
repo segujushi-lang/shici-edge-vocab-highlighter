@@ -21,11 +21,13 @@
     import: Object.freeze({ label: "导入释义", priority: 1 }),
     saved: Object.freeze({ label: "已有释义", priority: 2 }),
     mymemory: Object.freeze({ label: "MyMemory", priority: 3 }),
-    wiktionary: Object.freeze({ label: "维基词典", priority: 4 })
+    wiktionary: Object.freeze({ label: "维基词典", priority: 4 }),
+    google: Object.freeze({ label: "Google（实验）", priority: 5 })
   });
   const DEFAULT_TRANSLATION_SOURCES = Object.freeze({
     mymemory: true,
-    wiktionary: false
+    wiktionary: false,
+    google: false
   });
 
   const DEFAULT_CATEGORIES = Object.freeze({
@@ -40,7 +42,8 @@
     enabled: true,
     highlightColor: DEFAULT_HIGHLIGHT_COLOR,
     categories: DEFAULT_CATEGORIES,
-    translationSources: DEFAULT_TRANSLATION_SOURCES
+    translationSources: DEFAULT_TRANSLATION_SOURCES,
+    googleProxyUrl: ""
   });
 
   const WORD_PATTERN = /^[A-Za-z]+(?:['-][A-Za-z]+)*$/;
@@ -179,6 +182,79 @@
 
   function getTranslationSourceLabel(source) {
     return TRANSLATION_SOURCES[source]?.label || TRANSLATION_SOURCES.saved.label;
+  }
+
+  function normalizeGoogleProxyUrl(value) {
+    if (typeof value !== "string") {
+      return "";
+    }
+    const input = value.trim();
+    if (!input || input.length > 2048 || !/^https?:\/\//i.test(input)
+        || /[\u0000-\u0020\u007f]/.test(input) || /^https?:\/\/[^/]*@/i.test(input)) {
+      return "";
+    }
+
+    try {
+      const url = new URL(input);
+      const isLocalHttp = url.protocol === "http:"
+        && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+      if ((!isLocalHttp && url.protocol !== "https:") || !url.hostname
+          || url.username || url.password || url.href.includes("?") || url.href.includes("#")) {
+        return "";
+      }
+      return url.href;
+    } catch {
+      return "";
+    }
+  }
+
+  function getGoogleProxyOriginPattern(value) {
+    const endpoint = normalizeGoogleProxyUrl(value);
+    return endpoint ? `${new URL(endpoint).origin}/*` : "";
+  }
+
+  function extractGoogleTranslations(value) {
+    const segments = Array.isArray(value)
+      ? (Array.isArray(value[0]) ? value[0].map((segment) => Array.isArray(segment) ? segment[0] : "") : [])
+      : (Array.isArray(value?.sentences) ? value.sentences.map((sentence) => sentence?.trans) : []);
+    const results = [];
+    const mainTranslation = cleanTranslationText(segments.filter((segment) => typeof segment === "string").join(""));
+    if (mainTranslation && hasChineseText(mainTranslation)) {
+      results.push({ source: "google", text: mainTranslation });
+    }
+
+    const dictionary = Array.isArray(value)
+      ? (Array.isArray(value[1]) ? value[1] : [])
+      : (Array.isArray(value?.dict) ? value.dict : []);
+    const partOfSpeechLabels = {
+      noun: "名词",
+      verb: "动词",
+      adjective: "形容词",
+      adverb: "副词",
+      pronoun: "代词",
+      preposition: "介词",
+      conjunction: "连词",
+      interjection: "感叹词",
+      article: "冠词"
+    };
+    for (const group of dictionary) {
+      const terms = Array.isArray(group) ? group[1] : group?.terms;
+      if (!Array.isArray(terms)) {
+        continue;
+      }
+      const cleanedTerms = Array.from(new Set(terms.map(cleanTranslationText).filter(hasChineseText))).slice(0, 5);
+      if (cleanedTerms.length === 0) {
+        continue;
+      }
+      const rawPartOfSpeech = cleanPartOfSpeech(Array.isArray(group) ? group[0] : group?.pos);
+      const partOfSpeech = partOfSpeechLabels[rawPartOfSpeech.toLocaleLowerCase("en-US")] || rawPartOfSpeech;
+      results.push({
+        source: "google",
+        text: cleanedTerms.join("；"),
+        ...(partOfSpeech ? { partOfSpeech } : {})
+      });
+    }
+    return sanitizeTranslationResults(results).slice(0, 4);
   }
 
   function extractWiktionaryTranslations(value, word) {
@@ -344,8 +420,12 @@
           : DEFAULT_TRANSLATION_SOURCES.mymemory,
         wiktionary: typeof storedSources.wiktionary === "boolean"
           ? storedSources.wiktionary
-          : DEFAULT_TRANSLATION_SOURCES.wiktionary
-      }
+          : DEFAULT_TRANSLATION_SOURCES.wiktionary,
+        google: typeof storedSources.google === "boolean"
+          ? storedSources.google
+          : DEFAULT_TRANSLATION_SOURCES.google
+      },
+      googleProxyUrl: normalizeGoogleProxyUrl(stored.googleProxyUrl)
     };
   }
 
@@ -568,6 +648,9 @@
     cleanTranslationText,
     sanitizeTranslationResults,
     getTranslationSourceLabel,
+    normalizeGoogleProxyUrl,
+    getGoogleProxyOriginPattern,
+    extractGoogleTranslations,
     extractWiktionaryTranslations,
     isValidHighlightColor,
     normalizeHighlightColor,

@@ -18,6 +18,10 @@ const {
   MAX_IMPORT_WORDS,
   cleanTranslationText,
   sanitizeTranslationResults,
+  getTranslationSourceLabel,
+  normalizeGoogleProxyUrl,
+  getGoogleProxyOriginPattern,
+  extractGoogleTranslations,
   extractWiktionaryTranslations,
   decodeHtmlEntities,
   hasChineseText
@@ -26,7 +30,7 @@ const {
 const CONTEXT_MENU_ID = "vocab-glow-save-selection";
 const MYMEMORY_ENDPOINT = "https://api.mymemory.translated.net/get";
 const WIKTIONARY_ENDPOINT = "https://zh.wiktionary.org/w/api.php";
-const AUTOMATIC_TRANSLATION_SOURCES = new Set(["mymemory", "wiktionary"]);
+const AUTOMATIC_TRANSLATION_SOURCES = new Set(["mymemory", "wiktionary", "google"]);
 const HISTORY_LIMIT = 20;
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -146,9 +150,11 @@ async function handleMessage(message, sender) {
       return runWithHistory("修改高亮颜色", () => setHighlightColor(message.highlightColor));
     case "SET_TRANSLATION_SOURCE":
       return runWithHistory(
-        `${message.enabled ? "开启" : "关闭"}${message.source === "wiktionary" ? "维基词典" : "MyMemory"}翻译`,
+        `${message.enabled ? "开启" : "关闭"}${getTranslationSourceLabel(message.source)}翻译`,
         () => setTranslationSource(message.source, message.enabled)
       );
+    case "SET_GOOGLE_PROXY_URL":
+      return runWithHistory("修改 Google 反代地址", () => setGoogleProxyUrl(message.url));
     case "CREATE_CATEGORY":
       return runWithHistory(
         (_before, _after, result) => `新建分类 ${result.category.name}`,
@@ -265,7 +271,7 @@ async function saveWord({ word, translation = "", sourceUrl = "", categoryId }) 
     return entry;
   }
 
-  return finishTranslation(key, requestId, settings.translationSources);
+  return finishTranslation(key, requestId, settings);
 }
 
 async function importWordsWithHistory(value, categoryId) {
@@ -343,9 +349,9 @@ async function insertImportedWords(items, categoryId) {
   return { importedCount, skippedExistingCount, untranslatedCount };
 }
 
-async function finishTranslation(key, requestId, translationSources) {
+async function finishTranslation(key, requestId, settings) {
   try {
-    const automaticResults = await translateWord(key, translationSources);
+    const { results: automaticResults, failedSources } = await translateWord(key, settings);
     const { entries } = await getState();
     const current = entries[key];
 
@@ -354,7 +360,7 @@ async function finishTranslation(key, requestId, translationSources) {
     }
 
     const retainedResults = current.translationResults.filter(
-      (result) => !AUTOMATIC_TRANSLATION_SOURCES.has(result.source)
+      (result) => !AUTOMATIC_TRANSLATION_SOURCES.has(result.source) || failedSources.has(result.source)
     );
     const translationResults = sanitizeTranslationResults([...retainedResults, ...automaticResults]);
     const updated = {
@@ -389,25 +395,34 @@ async function finishTranslation(key, requestId, translationSources) {
   }
 }
 
-async function translateWord(word, translationSources) {
+async function translateWord(word, settings) {
+  const translationSources = settings.translationSources;
   const providers = [];
   if (translationSources?.mymemory) {
-    providers.push(translateWithMyMemory(word));
+    providers.push({ source: "mymemory", promise: translateWithMyMemory(word) });
   }
   if (translationSources?.wiktionary) {
-    providers.push(translateWithWiktionary(word));
+    providers.push({ source: "wiktionary", promise: translateWithWiktionary(word) });
+  }
+  if (translationSources?.google) {
+    providers.push({ source: "google", promise: translateWithGoogleProxy(word, settings.googleProxyUrl) });
   }
   if (providers.length === 0) {
     throw new Error("没有启用自动翻译来源");
   }
 
-  const settled = await Promise.allSettled(providers);
+  const settled = await Promise.allSettled(providers.map((provider) => provider.promise));
   const results = [];
-  for (const outcome of settled) {
-    if (outcome.status === "fulfilled") {
+  const failedSources = new Set();
+  for (let index = 0; index < settled.length; index += 1) {
+    const outcome = settled[index];
+    if (outcome.status === "fulfilled" && outcome.value.length > 0) {
       results.push(...outcome.value);
     } else {
-      console.warn("[拾词] 单个翻译来源失败：", outcome.reason);
+      failedSources.add(providers[index].source);
+      if (outcome.status === "rejected") {
+        console.warn("[拾词] 单个翻译来源失败：", outcome.reason);
+      }
     }
   }
 
@@ -415,7 +430,7 @@ async function translateWord(word, translationSources) {
   if (sanitized.length === 0) {
     throw new Error("已启用的翻译来源均未返回合适的中文释义");
   }
-  return sanitized;
+  return { results: sanitized, failedSources };
 }
 
 async function translateWithMyMemory(word) {
@@ -458,17 +473,43 @@ async function translateWithWiktionary(word) {
   return extractWiktionaryTranslations(page.extract, word);
 }
 
+async function requireGoogleProxyAccess(value) {
+  const endpoint = normalizeGoogleProxyUrl(value);
+  if (!endpoint) {
+    throw new Error("请先保存有效的 Google 反代地址");
+  }
+  const origin = getGoogleProxyOriginPattern(endpoint);
+  const granted = await chrome.permissions.contains({ origins: [origin] });
+  if (!granted) {
+    throw new Error("Google 反代域名尚未授权，请在弹窗中重新授权");
+  }
+  return endpoint;
+}
+
+async function translateWithGoogleProxy(word, proxyUrl) {
+  const url = new URL(await requireGoogleProxyAccess(proxyUrl));
+  url.searchParams.set("q", word);
+
+  const data = await fetchJson(url, "Google 反代");
+  return extractGoogleTranslations(data);
+}
+
 async function fetchJson(url, sourceName) {
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
 
   try {
-    const response = await fetch(url, { signal: controller.signal });
+    const response = await fetch(url, {
+      signal: controller.signal,
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      redirect: "error"
+    });
     if (!response.ok) {
       throw new Error(`${sourceName} 返回 ${response.status}`);
     }
-    return response.json();
+    return await response.json();
   } finally {
     clearTimeout(timeoutId);
   }
@@ -530,7 +571,7 @@ async function retryTranslation(value) {
     updatedAt: new Date().toISOString()
   };
   await setEntries(entries);
-  return finishTranslation(key, requestId, settings.translationSources);
+  return finishTranslation(key, requestId, settings);
 }
 
 async function createCategory(value, color) {
@@ -669,15 +710,39 @@ async function setHighlightColor(highlightColor) {
 }
 
 async function setTranslationSource(source, enabled) {
-  if (!Object.hasOwn({ mymemory: true, wiktionary: true }, source)) {
+  if (!AUTOMATIC_TRANSLATION_SOURCES.has(source)) {
     throw new Error("未知翻译来源");
   }
   const { settings } = await getState();
+  if (source === "google" && enabled) {
+    await requireGoogleProxyAccess(settings.googleProxyUrl);
+  }
   const nextSettings = sanitizeSettings({
     ...settings,
     translationSources: {
       ...settings.translationSources,
       [source]: Boolean(enabled)
+    }
+  });
+  await chrome.storage.local.set({ [STORAGE_KEYS.settings]: nextSettings });
+  return { settings: nextSettings };
+}
+
+async function setGoogleProxyUrl(value) {
+  if (typeof value !== "string") {
+    throw new Error("Google 反代地址格式无效");
+  }
+  const googleProxyUrl = normalizeGoogleProxyUrl(value);
+  if (value.trim() && !googleProxyUrl) {
+    throw new Error("反代地址须为无账号密码、查询参数或片段的 HTTPS URL；仅本机可用 HTTP");
+  }
+  const { settings } = await getState();
+  const nextSettings = sanitizeSettings({
+    ...settings,
+    googleProxyUrl,
+    translationSources: {
+      ...settings.translationSources,
+      google: googleProxyUrl ? settings.translationSources.google : false
     }
   });
   await chrome.storage.local.set({ [STORAGE_KEYS.settings]: nextSettings });
